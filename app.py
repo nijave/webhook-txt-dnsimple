@@ -25,7 +25,7 @@ else:
     logging.basicConfig(level=logging.INFO)
 
 
-def _validate() -> (str, typing.List[dns.rdata.Rdata]):
+def _validate(verb: str):
     app.logger.debug(
         json.dumps(
             {k: v for k, v in request.headers.items() if k not in ("Authorization",)}
@@ -40,7 +40,7 @@ def _validate() -> (str, typing.List[dns.rdata.Rdata]):
     domain = request.authorization.parameters["username"]
     token = request.authorization.parameters["password"]
 
-    app.logger.info('request from "%s" with token "%s..."', domain, token[0:4])
+    app.logger.info('%s request from "%s" with token "%s..."', verb, domain, token[0:4])
 
     if domain != request.view_args.get("hostname"):
         abort(401)
@@ -157,7 +157,11 @@ class DnsimpleProcessor:
         }
         success_code = 201
 
-        self.logger.info("creating new record in zone %d", self._zone_id)
+        self.logger.info(
+            "creating new record in zone %d for name %s",
+            self._zone_id,
+            self.record_name,
+        )
 
         response = self.session.post(
             url,
@@ -174,10 +178,12 @@ class DnsimpleProcessor:
 
         return True
 
-    def delete_records(self):
+    def delete_records(self, on_create=False):
         existing_records = self.find_records()
         for record in existing_records:
-            app.logger.info("deleting record id=%s", record["id"])
+            app.logger.info(
+                "deleting %srecord id=%s", "old " if on_create else "", record["id"]
+            )
             url = f"{self.base_url}/zones/{self._zone_id}/records/{record['id']}"
             response = self.session.delete(url)
             if response.status_code != 204:
@@ -190,7 +196,7 @@ class DnsimpleProcessor:
 
 @app.route("/txt/<hostname>", methods=["GET", "DELETE", "POST"])
 def _(hostname: str):
-    _validate()
+    _validate(verb=request.method)
 
     processor = DnsimpleProcessor(hostname)
 
@@ -198,12 +204,10 @@ def _(hostname: str):
         records = processor.find_records()
         return jsonify(records)
     elif request.method == "POST":
-        app.logger.info("deleting any existing records")
-        processor.delete_records()
+        processor.delete_records(on_create=True)
         content = request.json.get("content")
         if not content:
             abort(400)
-        app.logger.info("creating new record")
         processor.create_record(content)
         return jsonify({"status": "ok"})
     elif request.method == "DELETE":
