@@ -1,4 +1,4 @@
-FROM alpine
+FROM python:3-alpine
 
 RUN apk add python3 \
     && python3 -m ensurepip \
