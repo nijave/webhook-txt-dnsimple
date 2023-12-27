@@ -126,6 +126,16 @@ RECORD_CREATE = responses.Response(
     method="POST",
     url=f"https://api.dnsimple.com/v2/{os.environ['DNSIMPLE_ACCOUNT_ID']}/zones/1/records",
     status=201,
+    match=[
+        responses.matchers.json_params_matcher(
+            {
+                "name": "@",
+                "type": "TXT",
+                "content": TXT_VALUE,
+                "ttl": 60,
+            }
+        )
+    ],
     json={
         "data": {
             "id": 1,
