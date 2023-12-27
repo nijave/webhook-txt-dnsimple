@@ -150,7 +150,7 @@ class DnsimpleProcessor:
     def create_record(self, contents: str) -> None:
         url = f"{self.base_url}/zones/{self._zone_id}/records"
         payload = {
-            "name": self.hostname,
+            "name": self.record_name,
             "type": "TXT",
             "content": contents,
             "ttl": DEFAULT_RECORD_TTL,
