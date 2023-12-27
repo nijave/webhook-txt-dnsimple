@@ -1,15 +1,12 @@
-import ipaddress
 import json
 import logging
 import os
-import threading
 import time
 import typing
 
 import dns, dns.resolver, dns.rdata
-import lru
 import requests
-from flask import Flask, abort, request
+from flask import Flask, abort, request, jsonify
 
 AUTHENTICATION_MAP = json.loads(os.environ["AUTHENTICATION"])
 DNSIMPLE_ACCOUNT_ID = os.environ["DNSIMPLE_ACCOUNT_ID"]
@@ -17,15 +14,7 @@ DNSIMPLE_API_KEY = os.environ["DNSIMPLE_API_KEY"]
 
 DEFAULT_RECORD_TTL = 60
 
-"""
-Reduce requests to dnsimple and dns lookups
-by keeping DnsimpleProcessors around. Saves
-at least zone info
-"""
-CACHE = lru.LRU(10)
-CACHE_LOCK = threading.Lock()
-
-app = Flask("webhook-dyn-dnsimple")
+app = Flask("webhook-txt-dnsimple")
 
 gunicorn_logger = logging.getLogger("gunicorn.error")
 if len(gunicorn_logger.handlers) > 0:
@@ -53,41 +42,11 @@ def _validate() -> (str, typing.List[dns.rdata.Rdata]):
 
     app.logger.info('request from "%s" with token "%s..."', domain, token[0:4])
 
-    has_hostname = "hostname" in request.args
-
-    ips = []
-    # TODO fix shouldn't allow ipv4 in myipv6 and ipv6 in myip
-    for ip_type in ("myip", "myipv6"):
-        ip_value = request.args.get(ip_type)
-        if not ip_value:
-            continue
-        ips.append(ipaddress.ip_address(ip_value))
-    has_ip = len(ips) > 0
-
-    if not (has_hostname and has_ip):
-        app.logger.warning(
-            "request missing required arguments: has_hostname=%s has_ip=%s",
-            has_hostname,
-            has_ip,
-        )
-        abort(400)
-
-    if domain != request.args["hostname"]:
+    if domain != request.view_args.get("hostname"):
         abort(401)
 
     if AUTHENTICATION_MAP.get(domain) != token:
         abort(401)
-
-    records = []
-    for ip_addr in ips:
-        resource_record = dns.rdata.from_text(
-            rdclass=dns.rdataclass.IN,
-            rdtype=dns.rdatatype.A if ip_addr.version == 4 else dns.rdatatype.AAAA,
-            tok=str(ip_addr),
-        )
-        records.append(resource_record)
-
-    return domain, records
 
 
 class DnsimpleProcessor:
@@ -95,19 +54,27 @@ class DnsimpleProcessor:
 
     def __init__(
         self,
-        domain: str,
+        hostname: str,
         account_id: str = DNSIMPLE_ACCOUNT_ID,
         api_key: str = DNSIMPLE_API_KEY,
     ):
         self.logger = app.logger
 
-        self.domain = domain
-        self._zone_name = self._find_zone(domain).rstrip(".")
+        self.hostname = hostname
+        self._zone_name = self._find_zone(hostname).rstrip(".")
         self._zone_id = None
 
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {api_key}"})
         self.base_url = f"https://api.dnsimple.com/v2/{account_id}"
+
+        self._lookup_zone_id()
+
+        self.record_name = (
+            dns.name.from_text(self.hostname)
+            .relativize(dns.name.from_text(self._zone_name))
+            .to_text()
+        )
 
     def _find_zone(self, domain, max_time: float = 15.0):
         dns_name = dns.name.from_text(domain)
@@ -120,7 +87,6 @@ class DnsimpleProcessor:
             if time.time() - start_time >= max_time:
                 self.logger.warning("timeout looking up soa")
                 raise AttributeError("timed out looking up soa")
-
             try:
                 dns.resolver.resolve(dns_name, "soa", lifetime=0.75)
             except (
@@ -162,15 +128,15 @@ class DnsimpleProcessor:
         if self._zone_id is None:
             raise ValueError("couldn't find zone")
 
-    def _find_existing_records(
-        self, record_name: str, record_type: str
+    def find_records(
+        self,
     ) -> typing.List[typing.Dict[str, typing.Any]]:
         # TODO this doesn't handle pagination but there should only be up to 2 records...
         response = self.session.get(
             f"{self.base_url}/zones/{self._zone_id}/records",
             params={
-                "name": record_name,
-                "type": record_type,
+                "name": self.record_name,
+                "type": "TXT",
             },
         )
         total_pages = response.json()["pagination"]["total_pages"]
@@ -181,70 +147,19 @@ class DnsimpleProcessor:
 
         return response.json()["data"]
 
-    def _update_or_create_record(
-        self,
-        name: str,
-        existing_records: typing.Dict[str, typing.Any],
-        new_record: dns.rdata.Rdata,
-    ) -> None:
-        for record in existing_records[1:]:
-            self.logger.info(
-                "deleting extra record %d for zone %d", record["id"], self._zone_id
-            )
-            response = self.session.delete(
-                f"{self.base_url}/zones/{self._zone_id}/records/{record['id']}",
-            )
-            if response.status_code != 204:
-                self.logger.warning(
-                    "failed to delete record %d from zone %d",
-                    record["id"],
-                    self._zone_id,
-                )
-
-        old_record = {}
-        if len(existing_records) > 0:
-            old_record = existing_records[0]
-
-        if new_record.to_text() == old_record.get("content"):
-            self.logger.info(
-                "skipping update since record %d in zone %d hasn't changed",
-                old_record["id"],
-                self._zone_id,
-            )
-            return
-
-        self._create_new_record(name, new_record, old_record.get("id"))
-
-    def _create_new_record(
-        self,
-        name: str,
-        new_record: dns.rdata.Rdata,
-        old_record_id: int = None,
-    ) -> None:
-        update_method = self.session.post
+    def create_record(self, contents: str) -> None:
         url = f"{self.base_url}/zones/{self._zone_id}/records"
         payload = {
-            "name": name,
-            "type": new_record.rdtype.name,
-            "content": new_record.to_text(),
+            "name": self.hostname,
+            "type": "TXT",
+            "content": contents,
             "ttl": DEFAULT_RECORD_TTL,
         }
         success_code = 201
 
-        if old_record_id is not None:
-            self.logger.info(
-                "will patch existing record %d for zone %d",
-                old_record_id,
-                self._zone_id,
-            )
-            update_method = self.session.patch
-            url += f"/{old_record_id}"
-            del payload["type"]
-            success_code = 200
-        else:
-            self.logger.info("creating new record in zone %d", self._zone_id)
+        self.logger.info("creating new record in zone %d", self._zone_id)
 
-        response = update_method(
+        response = self.session.post(
             url,
             json=payload,
         )
@@ -257,53 +172,45 @@ class DnsimpleProcessor:
             )
             raise ValueError("failed to create/update dnsimple record")
 
-    def update_records(self, new_records: typing.List[dns.rdata.Rdata]) -> None:
-        if self._zone_id is None:
-            self._lookup_zone_id()
+        return True
 
-        record_name = (
-            dns.name.from_text(self.domain)
-            .relativize(dns.name.from_text(self._zone_name))
-            .to_text()
-        )
-
-        for record in new_records:
-            existing_records = self._find_existing_records(
-                record_name, record.rdtype.name
-            )
-
-            self._update_or_create_record(
-                existing_records=existing_records,
-                name=record_name,
-                new_record=record,
-            )
+    def delete_records(self):
+        existing_records = self.find_records()
+        for record in existing_records:
+            app.logger.info("deleting record id=%s", record["id"])
+            url = f"{self.base_url}/zones/{self._zone_id}/records/{record['id']}"
+            response = self.session.delete(url)
+            if response.status_code != 204:
+                app.logger.error("failed to delete record id=%s", record["id"])
+                app.logger.warning(
+                    "response content=%s", json.dumps(response.content())
+                )
+                raise ValueError(f"failed to delete record {record['id']}")
 
 
-@app.route("/", methods=["GET", "POST"])
-@app.route("/nic/update", methods=["GET", "POST"])
-def _():
-    domain, records = _validate()
+@app.route("/txt/<hostname>", methods=["GET", "DELETE", "POST"])
+def _(hostname: str):
+    _validate()
 
-    """
-    Don't lock around creating the processor. In theory, multiple threads
-    could create multiple processors concurrently. This will just keep one.
-    """
-    processor = None
-    with CACHE_LOCK:
-        if domain in CACHE:
-            processor = CACHE[domain]
+    processor = DnsimpleProcessor(hostname)
 
-    if processor is None:
-        processor = DnsimpleProcessor(domain)
+    if request.method == "GET":
+        records = processor.find_records()
+        return jsonify(records)
+    elif request.method == "POST":
+        app.logger.info("deleting any existing records")
+        processor.delete_records()
+        content = request.json.get("content")
+        if not content:
+            abort(400)
+        app.logger.info("creating new record")
+        processor.create_record(content)
+        return jsonify({"status": "ok"})
+    elif request.method == "DELETE":
+        processor.delete_records()
+        return jsonify({"status": "ok"})
 
-    processor.update_records(records)
-
-    with CACHE_LOCK:
-        if domain not in CACHE:
-            CACHE[domain] = processor
-            app.logger.info("added %s to processor cache", domain)
-
-    return "OK"
+    abort(400)
 
 
 if __name__ == "__main__":
