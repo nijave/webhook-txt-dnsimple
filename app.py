@@ -16,13 +16,19 @@ DEFAULT_RECORD_TTL = 60
 
 app = Flask("webhook-txt-dnsimple")
 
+if os.environ.get("DEBUG") == "true":
+    log_level = logging.DEBUG
+else:
+    log_level = logging.INFO
+
 gunicorn_logger = logging.getLogger("gunicorn.error")
+gunicorn_logger.setLevel(log_level)
 if len(gunicorn_logger.handlers) > 0:
     app.logger.handlers = gunicorn_logger.handlers
     print("using gunciorn logger with level", gunicorn_logger.level)
     app.logger.setLevel(gunicorn_logger.level)
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=log_level)
 
 
 def _validate(verb: str):
@@ -68,17 +74,21 @@ class DnsimpleProcessor:
         self.session.headers.update({"Authorization": f"Bearer {api_key}"})
         self.base_url = f"https://api.dnsimple.com/v2/{account_id}"
 
-        self._lookup_zone_id()
-
         self.record_name = (
             dns.name.from_text(self.hostname)
             .relativize(dns.name.from_text(self._zone_name))
             .to_text()
         )
 
+        self._lookup_zone_id()
+
     def _find_zone(self, domain, max_time: float = 15.0):
         dns_name = dns.name.from_text(domain)
         start_time = time.time()
+
+        resolver = dns.resolver.Resolver()
+        # Use public resolvers to avoid issues with split dns
+        resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
 
         while True:
             if len(dns_name.labels) <= 2:
@@ -88,7 +98,8 @@ class DnsimpleProcessor:
                 self.logger.warning("timeout looking up soa")
                 raise AttributeError("timed out looking up soa")
             try:
-                dns.resolver.resolve(dns_name, "soa", lifetime=0.75)
+                rv = resolver.resolve(dns_name, "soa", lifetime=0.75)
+                assert isinstance(rv, dns.resolver.Answer)
             except (
                 dns.resolver.NoAnswer,
                 dns.resolver.NoNameservers,
@@ -114,6 +125,8 @@ class DnsimpleProcessor:
                 f"{self.base_url}/zones",
                 params={"per_page": 100, "page": page},
             )
+
+            self.logger.debug("response: %s", response)
 
             for zone in response.json()["data"]:
                 if zone["name"] == self._zone_name:
@@ -162,6 +175,8 @@ class DnsimpleProcessor:
             self._zone_id,
             self.record_name,
         )
+
+        self.logger.debug("sending payload: %s", payload)
 
         response = self.session.post(
             url,
