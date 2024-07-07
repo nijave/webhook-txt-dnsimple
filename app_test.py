@@ -23,6 +23,12 @@ os.environ["DNSIMPLE_API_KEY"] = "secret"
 
 from app import app
 
+app.config.update(
+    {
+        "TESTING": True,
+    }
+)
+
 ZONE_RESPONSE = responses.Response(
     method="GET",
     url=f"https://api.dnsimple.com/v2/{os.environ['DNSIMPLE_ACCOUNT_ID']}/zones",
@@ -160,7 +166,9 @@ RECORD_DELETE = responses.Response(
     status=204,
 )
 
-DNS_ANSWER = mock.MagicMock(
+DNS_RESOLVER_INSTANCE = mock.Mock(spec=dns.resolver.Resolver)
+DNS_RESOLVER = mock.Mock(return_value=DNS_RESOLVER_INSTANCE)
+DNS_ANSWER = mock.Mock(
     return_value=dns.resolver.Answer(
         qname=dns.name.from_text(HOSTNAME),
         rdtype=dns.rdatatype.SOA,
@@ -182,6 +190,8 @@ example.com. 2031 IN SOA ns.icann.org. noc.dns.icann.org. 2022091379 7200 3600 1
     )
 )
 
+DNS_RESOLVER_INSTANCE.resolve = DNS_ANSWER
+
 
 def auth_header(hostname, api_key=API_KEY):
     return {
@@ -195,7 +205,7 @@ def client():
     return app.test_client()
 
 
-@mock.patch("app.dns.resolver.resolve", new=DNS_ANSWER)
+@mock.patch("app.dns.resolver.Resolver", new=DNS_RESOLVER)
 @responses.activate
 @pytest.mark.parametrize(
     "response_number,expected_results",
@@ -217,32 +227,36 @@ def test_find_records(client, response_number, expected_results):
     assert len(response.json) == expected_results
 
 
+@mock.patch("app.time.time", mock.Mock(return_value=1))
 @responses.activate
 def test_find_records_recursive_zone(client):
-    resolver = mock.Mock(
-        side_effect=[
-            dns.resolver.NXDOMAIN(
-                "The DNS query name does not exist: test.example.com."
-            ),
-            DNS_ANSWER,
-        ]
-    )
-
     responses.add(ZONE_RESPONSE)
     responses.add(RECORDS_RESPONSE[0])
     responses.add(RECORDS_RESPONSE[2])
 
-    with mock.patch("app.dns.resolver.resolve", new=resolver):
+    resolver = mock.MagicMock(
+        spec=dns.resolver.Resolver,
+    )
+
+    resolver.resolve.side_effect = [
+        dns.resolver.NXDOMAIN("The DNS query name does not exist: test.example.com."),
+        DNS_ANSWER(),
+    ]
+
+    with mock.patch(
+        "app.dns.resolver.Resolver",
+        return_value=resolver,
+    ):
         response = client.get(
             f"/txt/test.{HOSTNAME}",
             headers=auth_header(f"test.{HOSTNAME}"),
         )
 
-    assert response.status_code == 200
-    assert resolver.call_count == 2
+        assert resolver.resolve.call_count == 2
+        assert response.status_code == 200
 
 
-@mock.patch("app.dns.resolver.resolve", new=DNS_ANSWER)
+@mock.patch("app.dns.resolver.Resolver", new=DNS_RESOLVER)
 @responses.activate
 def test_create_record(client):
     responses.add(ZONE_RESPONSE)

@@ -5,7 +5,7 @@ set -eu
 TODAY=$(date +%Y%m%d)
 
 REGISTRY=ghcr.io
-IMAGE_BASE=nijave/webhook-dyn-dnsimple
+IMAGE_BASE=nijave/webhook-txt-dnsimple
 
 docker build \
 	-t $REGISTRY/$IMAGE_BASE \
